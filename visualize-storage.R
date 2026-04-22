@@ -1,103 +1,107 @@
 library(plotly)
 library(dplyr)
 library(fs)
+library(data.table)
 
-df <- read.csv("~/smb_folder_sizes.csv", stringsAsFactors = FALSE)
-df$size_bytes <- as.numeric(df$size_bytes)
-df <- df[!is.na(df$size_bytes) & df$size_bytes > 0, ]
+df <- data.table::fread("./data/smb_folder_sizes_deep.csv")
+df <- df[size_bytes > 0]
 
-# ── Derived labels ────────────────────────────────────────────────────────────
-df$size_human <- fs::fs_bytes(df$size_bytes)
-df$pct        <- round(df$size_bytes / sum(df$size_bytes) * 100, 1)
-df$file_count <- as.integer(df$file_count)
+ROOT <- "__root__"
 
-total_bytes <- sum(df$size_bytes)
-total_label <- paste0("Total: ", fs::fs_bytes(total_bytes))
+# ── Trim each path component to catch "Name (2019) /sub" trailing spaces ──────
+trim_path_components <- function(paths) {
+  vapply(paths, function(p) {
+    parts <- strsplit(p, "/", fixed = TRUE)[[1]]
+    paste(trimws(parts), collapse = "/")
+  }, character(1), USE.NAMES = FALSE)
+}
 
-# Add a synthetic root node so all folders nest under one parent
-root_row <- data.frame(
-  top         = total_label,
-  size_bytes  = total_bytes,
-  file_count  = sum(df$file_count),
-  size_human  = fs::fs_bytes(total_bytes),
-  pct         = 100,
-  stringsAsFactors = FALSE
+df[, folder := trim_path_components(folder)]
+
+# Deduplicate after trimming — two paths may now be identical
+df <- df[, .(size_bytes = sum(size_bytes), file_count = sum(file_count)), by = folder]
+
+df[, label  := sub(".*/", "", folder)]
+df[, parent := sub("/[^/]+$", "", folder)]
+df[, parent := ifelse(parent == folder, ROOT, parent)]
+
+orphans <- df[!parent %in% c(df$folder, ROOT)]
+cat(if (nrow(orphans) == 0) "✔ No orphans\n" else sprintf("WARNING: %d orphans remain\n", nrow(orphans)))
+
+# ── Root node — sum only leaf nodes to avoid double-counting ──────────────────
+leaf_nodes  <- df[!folder %in% df$parent]
+total_bytes <- sum(leaf_nodes$size_bytes)
+total_files <- sum(leaf_nodes$file_count)
+
+root <- data.table(
+  folder     = ROOT,
+  size_bytes = total_bytes,
+  file_count = total_files,
+  label      = "Media",
+  parent     = ""
 )
-df$parent <- total_label
-root_row$parent <- ""
+df_plot <- rbind(root, df, fill = TRUE)
 
-df_plot <- bind_rows(root_row, df)
+# ── Labels & hover ────────────────────────────────────────────────────────────
+df_plot[, size_human := as.character(fs::fs_bytes(size_bytes))]
+df_plot[, pct        := round(size_bytes / total_bytes * 100, 2)]
+df_plot[, hover := ifelse(
+  parent == "",
+  sprintf("<b>%s</b><br>%s total<br>%s files",
+          label, size_human, format(file_count, big.mark = ",")),
+  sprintf("<b>%s</b><br>Size: %s<br>Files: %s<br>Share: %s%%",
+          label, size_human,
+          format(file_count, big.mark = ","), pct)
+)]
 
-# ── Rich hover text ───────────────────────────────────────────────────────────
-df_plot$hover <- ifelse(
-  df_plot$parent == "",
-  sprintf("<b>%s</b><br>%s files total",
-          df_plot$top,
-          format(df_plot$file_count, big.mark = ",")),
-  sprintf("<b>%s</b><br>Size:  %s<br>Files: %s<br>Share: %s%%",
-          df_plot$top,
-          df_plot$size_human,
-          format(df_plot$file_count, big.mark = ","),
-          df_plot$pct)
-)
+# ── Depth-based colour ────────────────────────────────────────────────────────
+df_plot[, depth := ifelse(parent == "", 0L,
+                          lengths(strsplit(folder, "/", fixed = TRUE)))]
+depth_pal <- c("#0d1b2a","#1b4f72","#1a6b8a","#1abc9c","#48d1a8","#a8e6cf","#d4f5e9")
+df_plot[, colour := depth_pal[pmin(depth + 1L, length(depth_pal))]]
 
-# ── Colour scale: dark navy → vivid teal ─────────────────────────────────────
-n      <- nrow(df)
-pal    <- colorRampPalette(c("#0d1b2a", "#1b4f72", "#1abc9c", "#a8e6cf"))(n)
-# Sort by size so largest gets the most saturated colour
-df_sorted_idx          <- order(df$size_bytes, decreasing = FALSE)
-colour_map             <- character(nrow(df_plot))
-colour_map[1]          <- "#0d1b2a"          # root node
-colour_map[-1][df_sorted_idx] <- pal
-
+# ── Plot ──────────────────────────────────────────────────────────────────────
 plot_ly(
-  data        = df_plot,
-  type        = "treemap",
-  labels      = ~top,
-  parents     = ~parent,
-  values      = ~size_bytes,
-  customdata  = ~hover,
+  data          = df_plot,
+  type          = "treemap",
+  ids           = ~folder,
+  labels        = ~label,
+  parents       = ~parent,
+  values        = ~size_bytes,
+  customdata    = ~hover,
   hovertemplate = "%{customdata}<extra></extra>",
-  
-  # Show human-readable size + % inside each tile
-  text        = ~paste0(size_human, "\n", pct, "%"),
-  textinfo    = "label+text",
-  textfont    = list(family = "JetBrains Mono, monospace", size = 13, color = "#ffffff"),
-  
-  marker = list(
-    colors     = colour_map,
-    line       = list(width = 2, color = "#0a0a0a"),
-    pad        = list(t = 22, l = 4, r = 4, b = 4)
+  text          = ~paste0(size_human, "\n", pct, "%"),
+  textinfo      = "label+text",
+  textfont      = list(family = "JetBrains Mono, monospace", size = 12, color = "#ffffff"),
+  marker        = list(
+    colors = ~colour,
+    line   = list(width = 2, color = "#050e17"),
+    pad    = list(t = 22, l = 4, r = 4, b = 4)
   ),
-  
   pathbar = list(
     visible   = TRUE,
-    thickness = 26,
+    thickness = 28,
     textfont  = list(family = "JetBrains Mono, monospace", size = 12)
   ),
-  
-  tiling = list(packing = "squarify", squarifyratio = 1.618)  # golden ratio
+  maxdepth = 3,
+  tiling   = list(packing = "squarify", squarifyratio = 1.618)
 ) |>
   layout(
     title = list(
-      text = paste0("<b>Media Storage</b>  <span style='font-size:13px;color:#888'>",
-                    total_label, " across ",
-                    format(sum(df$file_count), big.mark = ","), " files</span>"),
-      font = list(family = "Georgia, serif", size = 20, color = "#1a1a1a"),
-      x    = 0.01
+      text = sprintf(
+        "<b>Media Storage</b>  <span style='font-size:13px;color:#888'>%s across %s files</span>",
+        fs::fs_bytes(total_bytes),
+        format(total_files, big.mark = ",")),
+      font = list(family = "Georgia, serif", size = 20, color = "#ffffff"),
+      x = 0.01
     ),
-    margin     = list(t = 60, l = 10, r = 10, b = 10),
+    margin        = list(t = 60, l = 10, r = 10, b = 10),
     paper_bgcolor = "#0d1b2a",
     plot_bgcolor  = "#0d1b2a",
-    font = list(color = "#ffffff")
+    font          = list(color = "#ffffff")
   ) |>
   config(
-    displayModeBar  = TRUE,
-    modeBarButtons  = list(list("toImage")),
-    toImageButtonOptions = list(
-      format   = "png",
-      filename = "media_storage",
-      scale    = 2          # 2× resolution export
-    ),
-    displaylogo = FALSE
+    modeBarButtons       = list(list("toImage")),
+    toImageButtonOptions = list(format = "png", filename = "media_storage", scale = 2),
+    displaylogo          = FALSE
   )
